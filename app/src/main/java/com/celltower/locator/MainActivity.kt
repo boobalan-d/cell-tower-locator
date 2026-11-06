@@ -50,6 +50,12 @@ class MainActivity : AppCompatActivity() {
         MEASURED("Target: My measurements only")
     }
 
+    private enum class HeadingMode(val label: String) {
+        AUTO("Heading: AUTO"),
+        COMPASS("Heading: COMPASS"),
+        GPS("Heading: GPS travel")
+    }
+
     // ---- services & helpers
     private lateinit var tm: TelephonyManager
     private lateinit var lm: LocationManager
@@ -73,6 +79,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSim: Button
     private lateinit var btnMode: Button
     private lateinit var btnHunt: Button
+    private lateinit var btnHeading: Button
+    private lateinit var tvTurn: TextView
 
     // ---- state
     private var registered: List<CellData> = emptyList()
@@ -84,6 +92,8 @@ class MainActivity : AppCompatActivity() {
     private var heading = Float.NaN
     private var compassNeedsCal = false
     private var mode = Mode.BEST
+    private var headingMode = HeadingMode.AUTO
+    private var validTaSeen = false     // Samsung-style modems report a fixed TA=0 until real TA appears
     private var mapFitted = false
     private var sensing = false
 
@@ -173,6 +183,14 @@ class MainActivity : AppCompatActivity() {
         btnSim = findViewById(R.id.btnSim)
         btnMode = findViewById(R.id.btnMode)
         btnHunt = findViewById(R.id.btnHunt)
+        btnHeading = findViewById(R.id.btnHeading)
+        tvTurn = findViewById(R.id.tvTurn)
+        btnHeading.text = headingMode.label
+        btnHeading.setOnClickListener {
+            headingMode = HeadingMode.values()[(headingMode.ordinal + 1) % HeadingMode.values().size]
+            btnHeading.text = headingMode.label
+            updateGuidance()
+        }
 
         tm = getSystemService(TelephonyManager::class.java)
         lm = getSystemService(LocationManager::class.java)
@@ -340,8 +358,9 @@ class MainActivity : AppCompatActivity() {
         val dbm = cell.dbm ?: return
         if (!loc.hasAccuracy() || loc.accuracy > 25f) return
         if (System.currentTimeMillis() - loc.time > 8_000) return
-        // TA = 0 is reported by some modems when idle; trust it only with a strong signal
-        val ta = cell.taM?.takeIf { cell.taRaw != 0 || dbm >= -80 }
+        // NetMonster's rule: ignore TA until a value > 0 has been seen (fixed-0 modems)
+        if ((cell.taRaw ?: 0) > 0) validTaSeen = true
+        val ta = cell.taM?.takeIf { validTaSeen }
         if (store.add(cell.siteKey, Sample(loc.latitude, loc.longitude, dbm, ta, System.currentTimeMillis()))) {
             if (store.count(cell.siteKey) % 25 == 0) saveAsync()
         }
@@ -377,7 +396,7 @@ class MainActivity : AppCompatActivity() {
         if (c.enb != null) sb.append("   (eNB ${c.enb}, sector ${c.sector})")
         sb.append("\nPCI ${c.pci ?: "?"}   Channel ${c.channel ?: "?"}")
         sb.append("\nTiming Advance: ")
-        if (c.taM != null) {
+        if (c.taM != null && validTaSeen) {
             val step = if (c.radio == "GSM") CellReader.GSM_TA_M else CellReader.LTE_TA_M
             sb.append("${c.taRaw} → tower ≈ ${c.taM} m away (±${(step / 2).roundToInt()} m)")
         } else sb.append("n/a (play a video or run a download to get it)")
@@ -516,7 +535,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun currentTarget(): Target? = when (mode) {
-        Mode.BEST -> solTarget(fused, "Best fit") ?: dbTarget()
+        Mode.BEST -> {
+            // Only let our own fit override the database once it is genuinely confident
+            val f = fused
+            val dbRange = dbTower?.rangeM?.toDouble()
+            val reliable = f != null && f.errorM <= 400.0 && (dbRange == null || f.errorM < dbRange)
+            if (reliable) solTarget(f, "Best fit")
+            else dbTarget() ?: solTarget(f, "Measured fit (LOW confidence)")
+        }
         Mode.DATABASE -> dbTarget()
         Mode.MEASURED -> solTarget(measured, "Measured fit")
     }
@@ -544,12 +570,14 @@ class MainActivity : AppCompatActivity() {
         if (t == null) {
             tvTarget.text = (if (mode == Mode.BEST) "No tower position yet." else "No position for this target mode yet.") + extra
             tvDistance.text = "—"
+            tvTurn.text = ""
             arrow.alpha = 0.2f
             return
         }
         tvTarget.text = "${t.label}$extra"
         if (loc == null) {
             tvDistance.text = "Waiting for GPS fix… (go outdoors)"
+            tvTurn.text = ""
             arrow.alpha = 0.2f
             return
         }
@@ -557,18 +585,45 @@ class MainActivity : AppCompatActivity() {
         val b = GeoMath.bearing(loc.latitude, loc.longitude, t.point.latitude, t.point.longitude)
         tvDistance.text = "${GeoMath.formatDistance(d)}   •   ${b.roundToInt()}° ${GeoMath.cardinal(b)}"
 
-        if (heading.isNaN()) {
+        val h = effectiveHeading(loc)
+        if (h == null) {
             arrow.alpha = 0.2f
-            if (compass.available) tvHeading.text = "Starting compass…"
+            tvTurn.text = ""
+            tvHeading.text = when {
+                headingMode == HeadingMode.GPS -> "GPS heading needs movement above 9 km/h. Use the bearing and map line."
+                compass.available -> "Starting compass…"
+                else -> getString(R.string.no_compass)
+            }
         } else {
-            // Arrow fades when you are inside the uncertainty circle (direction is meaningless there)
+            val (deg, source) = h
             val inside = t.errM != null && d < t.errM
             arrow.alpha = if (inside) 0.45f else 1f
-            arrow.rotation = ((b - heading) % 360f + 360f) % 360f
-            tvHeading.text = String.format(Locale.US, "Phone facing %d° %s%s%s",
-                heading.roundToInt(), GeoMath.cardinal(heading),
-                if (inside) "\nYou are inside the uncertainty zone – look up for the mast" else "",
-                if (compassNeedsCal) "\n⚠ Compass inaccurate: wave phone in a figure-8" else "")
+            arrow.rotation = ((b - deg) % 360f + 360f) % 360f
+            val rel = ((b - deg + 540f) % 360f) - 180f       // −180..180, + = right
+            val a = kotlin.math.abs(rel).roundToInt()
+            tvTurn.text = when {
+                inside -> "You are inside the uncertainty zone – look up for the mast"
+                a <= 15 -> "STRAIGHT AHEAD"
+                a >= 165 -> "BEHIND YOU – turn around"
+                rel > 0 -> "$a° to your RIGHT"
+                else -> "$a° to your LEFT"
+            }
+            tvHeading.text = String.format(Locale.US, "Heading %d° %s from %s%s",
+                deg.roundToInt(), GeoMath.cardinal(deg), source,
+                if (source == "compass" && compassNeedsCal) "\n⚠ Compass inaccurate: wave phone in a figure-8, away from metal" else "")
+        }
+    }
+
+    /** Compass when walking; GPS course when moving fast (vehicles distort the compass). */
+    private fun effectiveHeading(loc: Location): Pair<Float, String>? {
+        val moving = loc.hasSpeed() && loc.speed >= 2.5f && loc.hasBearing() &&
+            System.currentTimeMillis() - loc.time < 4_000
+        val gps = if (moving) loc.bearing to "GPS travel direction" else null
+        val comp = if (!heading.isNaN()) heading to "compass" else null
+        return when (headingMode) {
+            HeadingMode.GPS -> gps
+            HeadingMode.COMPASS -> comp
+            HeadingMode.AUTO -> gps ?: comp
         }
     }
 
@@ -605,7 +660,7 @@ class MainActivity : AppCompatActivity() {
             fitCircle.points = Polygon.pointsAsCircle(p, s.errorM.coerceAtLeast(10.0)); ov.add(fitCircle)
             fitMarker.position = p; ov.add(fitMarker)
         }
-        val ta = serving?.taM
+        val ta = serving?.taM?.takeIf { validTaSeen }
         if (loc != null && ta != null) {
             taRing.points = Polygon.pointsAsCircle(GeoPoint(loc.latitude, loc.longitude), ta.toDouble())
             ov.add(taRing)

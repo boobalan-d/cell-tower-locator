@@ -43,6 +43,16 @@ object CellReader {
     /** One GSM TA step ≈ 553.5 m. */
     const val GSM_TA_M = 553.5
 
+    // Valid ranges as used by NetMonster Core (OEM modems often report junk outside them)
+    private val LTE_CI = 1..268_435_454
+    private val LTE_TAC = 1..65_534
+    private val LTE_PCI = 0..503
+    private val GSM_CID = 1..65_535
+    private val LAC = 1..65_534
+    private val UMTS_CID = 1..268_435_455
+    private val NR_NCI = 1L..68_719_476_735L
+    private val NR_PCI = 0..1007
+
     private fun ok(v: Int): Boolean = v != CellInfo.UNAVAILABLE && v != Int.MAX_VALUE && v != Int.MIN_VALUE
     private fun okL(v: Long): Boolean = v != CellInfo.UNAVAILABLE_LONG && v != Long.MAX_VALUE
 
@@ -52,8 +62,8 @@ object CellReader {
             val s = info.cellSignalStrength
             CellData(
                 "LTE", id.mccString, id.mncString,
-                id.tac.takeIf { ok(it) }, id.ci.takeIf { ok(it) }?.toLong(),
-                id.pci.takeIf { ok(it) }, id.earfcn.takeIf { ok(it) },
+                id.tac.takeIf { it in LTE_TAC }, id.ci.takeIf { it in LTE_CI }?.toLong(),
+                id.pci.takeIf { it in LTE_PCI }, id.earfcn.takeIf { ok(it) },
                 s.dbm.takeIf { ok(it) }, info.isRegistered,
                 id.operatorAlphaLong?.toString(),
                 s.timingAdvance.takeIf { it in 0..1282 },
@@ -65,8 +75,8 @@ object CellReader {
             val s = info.cellSignalStrength as CellSignalStrengthNr
             CellData(
                 "NR", id.mccString, id.mncString,
-                id.tac.takeIf { ok(it) }, id.nci.takeIf { okL(it) },
-                id.pci.takeIf { ok(it) }, id.nrarfcn.takeIf { ok(it) },
+                id.tac.takeIf { ok(it) && it > 0 }, id.nci.takeIf { okL(it) && it in NR_NCI },
+                id.pci.takeIf { it in NR_PCI }, id.nrarfcn.takeIf { ok(it) },
                 s.dbm.takeIf { ok(it) }, info.isRegistered,
                 id.operatorAlphaLong?.toString()
             )
@@ -76,7 +86,7 @@ object CellReader {
             val s = info.cellSignalStrength
             CellData(
                 "UMTS", id.mccString, id.mncString,
-                id.lac.takeIf { ok(it) }, id.cid.takeIf { ok(it) }?.toLong(),
+                id.lac.takeIf { it in LAC }, id.cid.takeIf { it in UMTS_CID }?.toLong(),
                 id.psc.takeIf { ok(it) }, id.uarfcn.takeIf { ok(it) },
                 s.dbm.takeIf { ok(it) }, info.isRegistered,
                 id.operatorAlphaLong?.toString()
@@ -87,7 +97,7 @@ object CellReader {
             val s = info.cellSignalStrength
             CellData(
                 "GSM", id.mccString, id.mncString,
-                id.lac.takeIf { ok(it) }, id.cid.takeIf { ok(it) }?.toLong(),
+                id.lac.takeIf { it in LAC }, id.cid.takeIf { it in GSM_CID }?.toLong(),
                 id.bsic.takeIf { ok(it) }, id.arfcn.takeIf { ok(it) },
                 s.dbm.takeIf { ok(it) }, info.isRegistered,
                 id.operatorAlphaLong?.toString(),

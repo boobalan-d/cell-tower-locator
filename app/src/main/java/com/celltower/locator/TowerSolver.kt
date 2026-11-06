@@ -39,7 +39,7 @@ data class Solution(
  */
 object TowerSolver {
     const val MIN_SIGNAL_POINTS = 8
-    const val MIN_SPREAD_M = 50.0
+    const val MIN_SPREAD_M = 150.0
     private const val SIGMA_RSS = 6.0     // dB, typical shadow fading
     private const val SIGMA_TA = 80.0     // m, LTE TA resolution ≈ 78 m
     private const val DELTA_CHI2_68 = 2.3 // 2-parameter 68 % contour

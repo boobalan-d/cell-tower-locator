@@ -11,7 +11,7 @@ import android.location.Location
 /**
  * Compass giving heading relative to TRUE north (magnetic declination corrected
  * from your GPS position), smoothed so the arrow doesn't jitter.
- * Hold the phone flat (screen facing the sky) for best results.
+ * Works with the phone held flat or upright (camera pointing ahead).
  */
 class Compass(
     context: Context,
@@ -28,7 +28,6 @@ class Compass(
     private var hasGravity = false
     private var hasGeomag = false
     private val rotMat = FloatArray(9)
-    private val orient = FloatArray(3)
 
     private var declination = 0f
     private var smoothed = Float.NaN
@@ -80,8 +79,11 @@ class Compass(
     }
 
     private fun emit() {
-        SensorManager.getOrientation(rotMat, orient)
-        val magneticDeg = Math.toDegrees(orient[0].toDouble()).toFloat()
+        // Heading of the direction the phone is POINTING, valid whether the phone is held
+        // flat (top edge points ahead) or upright like a camera (back points ahead).
+        // World = R · device. Device Y (top) = column 1, device Z (out of screen) = column 2.
+        // Horizontal pointing vector = Y_h − Z_h. When flat Z_h≈0, when upright Y_h≈0.
+        val magneticDeg = GeoMath.pointingHeading(rotMat) ?: return
         val trueDeg = (magneticDeg + declination + 720f) % 360f
         smoothed = if (smoothed.isNaN()) trueDeg else {
             val diff = ((trueDeg - smoothed + 540f) % 360f) - 180f   // shortest way round

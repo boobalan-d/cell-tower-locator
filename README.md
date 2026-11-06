@@ -15,11 +15,12 @@ it uses only free data sources.
 | Saved measurements | Every point is saved per tower, so accuracy keeps improving across days. Export to CSV, or long-press Export to clear. |
 | Hunt sound | Beeps faster as the signal gets stronger, so you can walk toward the mast without staring at the screen |
 | Trend indicator | ▲ stronger / ▼ weaker over the last few seconds |
-| Direction arrow | Compass, corrected to true north, points to the target. It fades when you're inside the error circle. |
+| Direction arrow + turn hints | A tilt-proof compass (works flat or upright, corrected to true north), or the GPS travel direction when moving, points to the target. It also says "35° to your RIGHT" / "STRAIGHT AHEAD". |
 | Free map | OpenStreetMap with the database marker (blue), best fit (green), error circles, TA ring and a line to the target |
 | Directions | Opens walking directions to the tower in Google Maps |
 | Neighbour cells | Nearby cells by signal strength |
-| Verified by tests | `TowerSolverTest` simulates hidden towers and checks the solver's accuracy on every build |
+| Clean modem data | Uses NetMonster Core's validity ranges and its rule for ignoring fixed-zero Timing Advance |
+| Verified by tests | `TowerSolverTest` (simulated hidden towers) and `HeadingTest` (compass maths at every angle and tilt) run on every build |
 
 ## What "precise" really means (please read)
 No free or paid app knows exact tower coordinates. Operators don't publish them in India.
@@ -91,6 +92,15 @@ Or build it yourself:
     is about 30 m when looping around it, and is about 40 m from just three TA readings.
 * `MeasurementStore.kt` saves points as JSON per site and exports CSV.
 * `Compass.kt` uses the rotation vector, adds `GeomagneticField` declination and applies a wrap-safe low-pass filter. `GeoMath.kt` has the haversine distance and bearing.
+
+## If the direction looks wrong
+* **Check the map first.** The red line on the map goes from you to the tower and does not use the compass.
+  If the line is right but the arrow isn't, the compass is the problem.
+* **Compass problems:** wave the phone in a figure-8, and stay away from metal, magnets, magnetic phone cases and car dashboards.
+  The phone can be held flat or upright.
+* **In a car, bike or bus,** use **Heading: GPS travel**. This is the default (AUTO) above 9 km/h. It uses your direction of travel instead of the compass,
+  because vehicle metal ruins magnetic compasses.
+* **Database problems:** some OpenCelliD entries are placed badly (few samples). Compare with the green "best fit" once you've moved around.
 
 ## Getting the most accurate result
 1. Tap **Locate tower** to get the database position.

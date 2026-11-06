@@ -37,4 +37,16 @@ object GeoMath {
 
     fun formatDistance(m: Double): String =
         if (m < 1000) "${m.roundToInt()} m" else String.format(Locale.US, "%.2f km", m / 1000)
+
+    /**
+     * Heading (degrees from the sensor's north) of the direction the phone points, from an
+     * Android rotation matrix (row-major, world = R · device, world axes East-North-Up).
+     * Works flat (top edge ahead) and upright (camera ahead). Null if pointing straight up/down.
+     */
+    fun pointingHeading(r: FloatArray): Float? {
+        val hx = r[1] - r[2]   // east:  device Y − device Z
+        val hy = r[4] - r[5]   // north
+        if (hx * hx + hy * hy < 1e-4f) return null
+        return ((Math.toDegrees(atan2(hx.toDouble(), hy.toDouble())) + 360.0) % 360.0).toFloat()
+    }
 }
