@@ -25,7 +25,8 @@ class TowerSolverTest {
 
     private fun rssAt(p: DoubleArray, rnd: Random): Int {
         val d = max(GeoMath.distance(p[0], p[1], tower[0], tower[1]), 10.0)
-        return (-45 - 33 * log10(d) + rnd.nextGaussian() * 6).toInt()
+        // Realistic LTE: about -100 dBm at 1 km, path-loss exponent 3.3, 6 dB fading
+        return (-100 - 33 * (log10(d) - 3) + rnd.nextGaussian() * 6).toInt()
     }
 
     private fun median(v: List<Double>) = v.sorted()[v.size / 2]
@@ -59,7 +60,7 @@ class TowerSolverTest {
         }
         // A plain centroid is stuck inside the walked circle: ~280 m off here
         println("walk-beside median error = ${median(errors)} m")
-        assertTrue(median(errors) < 200)
+        assertTrue(median(errors) < 150)
     }
 
     @Test

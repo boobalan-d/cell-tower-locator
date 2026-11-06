@@ -76,11 +76,11 @@ of the phones that saw that cell. In practice:
   For LTE, eNB = ECI >> 8. One LTE TA step is 16 Ts = 0.52 µs round trip, which is about 78.12 m one way.
 * `TowerLookup.kt` calls `opencellid.org/cell/get` (JSON) and caches the result.
 * `TowerSolver.kt` (the core) minimises a combined χ² cost over candidate tower positions p:
-  * **Signal term:** RSRPᵢ = A − 10·n·log₁₀(dᵢ(p)). A and n are solved by linear regression at every candidate, with n limited to 1.6–5.0 and σ = 6 dB shadowing.
+  * **Signal term:** RSRPᵢ = A − 10·n·log₁₀(dᵢ(p)). A and n are solved at every candidate by regularised least squares, with soft physics priors n ≈ 3.3 ± 0.8 and RSRP at 1 km ≈ −100 ± 20 dBm, and σ = 6 dB shadowing. Without these priors, a far-away candidate could "explain" random fading. A failing test caught exactly that.
   * **TA term:** (dᵢ(p) − TAᵢ·78 m)² / (80 m)².
   * **Prior term:** distance to the OpenCelliD point divided by σ (half the database range).
   * The search is a coarse-to-fine grid (81² then 41² ×3, searching up to 15 km, then refining to about 0.1 m).
-    The ±error is the 68 % contour (Δχ² = 2.3) measured in 16 directions.
+    The ±error is the 68 % contour (Δχ² = 2.3) measured in 16 directions. It is widened whenever a second plausible region exists anywhere on the grid, such as the mirror side of a straight drive, so the circle never pretends to be more certain than the data allows.
   * Unlike a centroid, the fit can place the tower outside the area you walked.
     In the simulated tests the error falls from about 280 m to about 120 m when walking beside a tower,
     is about 30 m when looping around it, and is about 40 m from just three TA readings.
