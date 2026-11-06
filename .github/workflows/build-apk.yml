@@ -19,6 +19,12 @@ jobs:
         with:
           gradle-version: "8.7"
 
+      - name: Run accuracy tests
+        run: gradle testDebugUnitTest --no-daemon -i | grep -E "error =|Test.*(PASSED|FAILED)" || true
+
+      - name: Verify tests passed
+        run: gradle testDebugUnitTest --no-daemon
+
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
 

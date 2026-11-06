@@ -27,7 +27,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.BoundingBox
@@ -42,18 +44,26 @@ import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
-    // ---- system services & helpers
+    private enum class Mode(val label: String) {
+        BEST("Target: BEST (fused)"),
+        DATABASE("Target: OpenCelliD only"),
+        MEASURED("Target: My measurements only")
+    }
+
+    // ---- services & helpers
     private lateinit var tm: TelephonyManager
     private lateinit var lm: LocationManager
     private lateinit var compass: Compass
     private lateinit var lookup: TowerLookup
-    private val estimator = SignalEstimator()
+    private lateinit var store: MeasurementStore
+    private val hunt = HuntSound()
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
 
     // ---- views
     private lateinit var tvStatus: TextView
     private lateinit var tvNetwork: TextView
     private lateinit var tvSignal: TextView
+    private lateinit var tvTrend: TextView
     private lateinit var tvTarget: TextView
     private lateinit var tvDistance: TextView
     private lateinit var tvHeading: TextView
@@ -61,6 +71,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var arrow: ImageView
     private lateinit var map: MapView
     private lateinit var btnSim: Button
+    private lateinit var btnMode: Button
+    private lateinit var btnHunt: Button
 
     // ---- state
     private var registered: List<CellData> = emptyList()
@@ -71,15 +83,23 @@ class MainActivity : AppCompatActivity() {
     private var myLoc: Location? = null
     private var heading = Float.NaN
     private var compassNeedsCal = false
-    private var useEstimate = false
+    private var mode = Mode.BEST
     private var mapFitted = false
     private var sensing = false
+
+    private var fused: Solution? = null
+    private var measured: Solution? = null
+    private var solving = false
+    private var solvedFor = ""          // "siteKey|count|db" of the last solve
+    private var lastSolveAt = 0L
+
+    private val recent = ArrayDeque<Pair<Long, Int>>()   // (time, dBm) for trend
 
     private val handler = Handler(Looper.getMainLooper())
     private val poll = object : Runnable {
         override fun run() {
             refreshCells()
-            handler.postDelayed(this, 3000)
+            handler.postDelayed(this, if (hunt.running) 1000L else 2000L)
         }
     }
 
@@ -87,6 +107,11 @@ class MainActivity : AppCompatActivity() {
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
             if (res[Manifest.permission.ACCESS_FINE_LOCATION] == true) startSensing()
             else tvStatus.text = getString(R.string.need_permission)
+        }
+
+    private val exportLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+            if (uri != null) exportTo(uri)
         }
 
     // Implement every method: on Android 10 they are abstract, lambdas would crash.
@@ -99,34 +124,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---- map overlays
-    private val meMarker by lazy {
-        Marker(map).apply {
-            title = "You"
-            icon = ContextCompat.getDrawable(this@MainActivity, R.drawable.ic_me)
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-        }
+    private fun marker(title: String, iconRes: Int, bottom: Boolean) = Marker(map).apply {
+        this.title = title
+        this.icon = ContextCompat.getDrawable(this@MainActivity, iconRes)
+        setAnchor(Marker.ANCHOR_CENTER, if (bottom) Marker.ANCHOR_BOTTOM else Marker.ANCHOR_CENTER)
     }
-    private val dbMarker by lazy {
-        Marker(map).apply {
-            title = "Tower (OpenCelliD estimate)"
-            icon = ContextCompat.getDrawable(this@MainActivity, R.drawable.ic_tower)
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-        }
+    private fun circle(color: Int, fill: Int) = Polygon(map).apply {
+        fillPaint.color = fill
+        outlinePaint.color = color
+        outlinePaint.strokeWidth = 3f
     }
-    private val estMarker by lazy {
-        Marker(map).apply {
-            title = "Tower (your signal estimate)"
-            icon = ContextCompat.getDrawable(this@MainActivity, R.drawable.ic_tower_est)
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-        }
-    }
-    private val rangeCircle by lazy {
-        Polygon(map).apply {
-            fillPaint.color = 0x221E88E5
-            outlinePaint.color = 0x991E88E5.toInt()
-            outlinePaint.strokeWidth = 3f
-        }
-    }
+    private val meMarker by lazy { marker("You", R.drawable.ic_me, false) }
+    private val dbMarker by lazy { marker("Tower – OpenCelliD", R.drawable.ic_tower, true) }
+    private val fitMarker by lazy { marker("Tower – best estimate", R.drawable.ic_tower_est, true) }
+    private val dbCircle by lazy { circle(0x991E88E5.toInt(), 0x161E88E5) }
+    private val fitCircle by lazy { circle(0xCC43A047.toInt(), 0x2243A047) }
+    private val taRing by lazy { circle(0xCCFB8C00.toInt(), 0x00000000) }
     private val line by lazy {
         Polyline(map).apply {
             outlinePaint.color = 0xFFE53935.toInt()
@@ -150,6 +163,7 @@ class MainActivity : AppCompatActivity() {
         tvStatus = findViewById(R.id.tvStatus)
         tvNetwork = findViewById(R.id.tvNetwork)
         tvSignal = findViewById(R.id.tvSignal)
+        tvTrend = findViewById(R.id.tvTrend)
         tvTarget = findViewById(R.id.tvTarget)
         tvDistance = findViewById(R.id.tvDistance)
         tvHeading = findViewById(R.id.tvHeading)
@@ -157,10 +171,13 @@ class MainActivity : AppCompatActivity() {
         arrow = findViewById(R.id.arrow)
         map = findViewById(R.id.map)
         btnSim = findViewById(R.id.btnSim)
+        btnMode = findViewById(R.id.btnMode)
+        btnHunt = findViewById(R.id.btnHunt)
 
         tm = getSystemService(TelephonyManager::class.java)
         lm = getSystemService(LocationManager::class.java)
         lookup = TowerLookup(this)
+        store = MeasurementStore(File(filesDir, "measurements.json"))
         compass = Compass(this) { deg, needsCal ->
             heading = deg
             compassNeedsCal = needsCal
@@ -170,9 +187,19 @@ class MainActivity : AppCompatActivity() {
         setupMap()
 
         findViewById<Button>(R.id.btnLookup).setOnClickListener { doLookup() }
-        findViewById<Button>(R.id.btnTarget).setOnClickListener { toggleTarget() }
         findViewById<Button>(R.id.btnMaps).setOnClickListener { openDirections() }
         findViewById<Button>(R.id.btnKey).setOnClickListener { askApiKey() }
+        val btnExport = findViewById<Button>(R.id.btnExport)
+        btnExport.setOnClickListener { exportLauncher.launch("cell_measurements.csv") }
+        btnExport.setOnLongClickListener { confirmClear(); true }
+        btnMode.text = mode.label
+        btnMode.setOnClickListener {
+            mode = Mode.values()[(mode.ordinal + 1) % Mode.values().size]
+            btnMode.text = mode.label
+            mapFitted = false
+            updateGuidance(); updateMap()
+        }
+        btnHunt.setOnClickListener { toggleHunt() }
         btnSim.setOnClickListener {
             if (registered.size > 1) {
                 simIndex = (simIndex + 1) % registered.size
@@ -203,6 +230,8 @@ class MainActivity : AppCompatActivity() {
         map.onPause()
         compass.stop()
         stopSensing()
+        if (hunt.running) toggleHunt()
+        saveAsync()
     }
 
     // ------------------------------------------------------------------ sensing
@@ -218,7 +247,7 @@ class MainActivity : AppCompatActivity() {
         for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
             if (!lm.allProviders.contains(p)) continue
             try {
-                lm.requestLocationUpdates(p, 2000L, 0f, locListener, Looper.getMainLooper())
+                lm.requestLocationUpdates(p, 1000L, 0f, locListener, Looper.getMainLooper())
                 lm.getLastKnownLocation(p)?.let { if (myLoc == null) onNewLocation(it) }
             } catch (_: Exception) { }
         }
@@ -234,7 +263,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun onNewLocation(loc: Location) {
         val cur = myLoc
-        // Prefer GPS; accept network fixes only if we have nothing recent
         val accept = cur == null || loc.provider == LocationManager.GPS_PROVIDER ||
             System.currentTimeMillis() - cur.time > 10_000
         if (!accept) return
@@ -251,6 +279,7 @@ class MainActivity : AppCompatActivity() {
         try {
             tm.requestCellInfoUpdate(mainExecutor, object : TelephonyManager.CellInfoCallback() {
                 override fun onCellInfo(cellInfo: MutableList<CellInfo>) = handleCells(cellInfo)
+                @SuppressLint("MissingPermission")
                 override fun onError(errorCode: Int, detail: Throwable?) =
                     handleCells(tm.allCellInfo.orEmpty())
             })
@@ -269,37 +298,74 @@ class MainActivity : AppCompatActivity() {
         if (registered.isEmpty()) {
             tvNetwork.text = getString(R.string.no_cell)
             tvSignal.text = ""
+            tvTrend.text = ""
             tvNeighbors.text = ""
+            hunt.dbm = null
             return
         }
         if (simIndex >= registered.size) simIndex = 0
         val cell = registered[simIndex]
         val changed = cell.key != serving?.key
+        val siteChanged = cell.siteKey != serving?.siteKey
         serving = cell
 
         tvNetwork.text = describe(cell)
         tvSignal.text = cell.dbm?.let { "$it dBm  •  ${CellReader.quality(cell)}" } ?: "Signal: n/a"
+        hunt.dbm = cell.dbm
+        updateTrend(cell.dbm, siteChanged)
         tvNeighbors.text = if (neighbors.isEmpty()) "Neighbour cells: none reported" else
             "Neighbour cells (strongest first):\n" + neighbors.take(6).joinToString("\n") {
                 "  ${it.radio}  PCI ${it.pci ?: "?"}  ch ${it.channel ?: "?"}  ${it.dbm ?: "?"} dBm"
             }
 
-        // Record a sample for the user's own tower estimate (only with a good, fresh GPS fix)
-        val loc = myLoc
-        if (loc != null && cell.dbm != null && loc.hasAccuracy() && loc.accuracy <= 30f &&
-            System.currentTimeMillis() - loc.time < 10_000
-        ) {
-            estimator.add(cell.siteKey, loc.latitude, loc.longitude, cell.dbm)
-        }
+        recordSample(cell)
 
+        if (siteChanged) {
+            fused = null; measured = null; solvedFor = ""
+        }
         if (changed) {
             dbTower = null
             lookupMsg = null
             mapFitted = false
             if (!prefs.getString("api_key", null).isNullOrBlank()) doLookup()
         }
+        maybeSolve()
         updateGuidance()
         updateMap()
+    }
+
+    /** Save a measurement only with a good, fresh GPS fix. */
+    private fun recordSample(cell: CellData) {
+        val loc = myLoc ?: return
+        val dbm = cell.dbm ?: return
+        if (!loc.hasAccuracy() || loc.accuracy > 25f) return
+        if (System.currentTimeMillis() - loc.time > 8_000) return
+        // TA = 0 is reported by some modems when idle; trust it only with a strong signal
+        val ta = cell.taM?.takeIf { cell.taRaw != 0 || dbm >= -80 }
+        if (store.add(cell.siteKey, Sample(loc.latitude, loc.longitude, dbm, ta, System.currentTimeMillis()))) {
+            if (store.count(cell.siteKey) % 25 == 0) saveAsync()
+        }
+    }
+
+    private fun saveAsync() {
+        if (!store.needsSave()) return
+        lifecycleScope.launch(Dispatchers.IO) { store.save() }
+    }
+
+    private fun updateTrend(dbm: Int?, reset: Boolean) {
+        if (reset) recent.clear()
+        val now = System.currentTimeMillis()
+        if (dbm != null) recent.addLast(now to dbm)
+        while (recent.isNotEmpty() && now - recent.first().first > 12_000) recent.removeFirst()
+        val newer = recent.filter { now - it.first <= 6_000 }.map { it.second }
+        val older = recent.filter { now - it.first > 6_000 }.map { it.second }
+        if (newer.isEmpty() || older.isEmpty()) { tvTrend.text = ""; return }
+        val delta = newer.average() - older.average()
+        tvTrend.text = when {
+            delta >= 2 -> String.format(Locale.US, "▲ Getting stronger (+%.0f dB) – keep going", delta)
+            delta <= -2 -> String.format(Locale.US, "▼ Getting weaker (%.0f dB) – turn around", delta)
+            else -> "■ Steady"
+        }
     }
 
     private fun describe(c: CellData): String {
@@ -310,7 +376,40 @@ class MainActivity : AppCompatActivity() {
         sb.append("\nCell ID ${c.cid}")
         if (c.enb != null) sb.append("   (eNB ${c.enb}, sector ${c.sector})")
         sb.append("\nPCI ${c.pci ?: "?"}   Channel ${c.channel ?: "?"}")
+        sb.append("\nTiming Advance: ")
+        if (c.taM != null) {
+            val step = if (c.radio == "GSM") CellReader.GSM_TA_M else CellReader.LTE_TA_M
+            sb.append("${c.taRaw} → tower ≈ ${c.taM} m away (±${(step / 2).roundToInt()} m)")
+        } else sb.append("n/a (play a video or run a download to get it)")
         return sb.toString()
+    }
+
+    // ------------------------------------------------------------------ solving
+
+    private fun maybeSolve() {
+        val cell = serving ?: return
+        val site = cell.siteKey
+        val db = dbTower
+        val tag = "$site|${store.count(site)}|${db?.lat}"
+        val now = System.currentTimeMillis()
+        if (solving || tag == solvedFor || now - lastSolveAt < 3_000) return
+        solving = true
+        lastSolveAt = now
+        val samples = store.snapshot(site)
+        val prior = db?.let {
+            Prior(it.lat, it.lon, ((it.rangeM ?: 1000) / 2.0).coerceIn(150.0, 2000.0))
+        }
+        lifecycleScope.launch {
+            val (f, m) = withContext(Dispatchers.Default) {
+                val meas = TowerSolver.solve(samples, null)
+                val fus = if (prior != null) TowerSolver.solve(samples, prior) else meas
+                fus to meas
+            }
+            solving = false
+            if (serving?.siteKey != site) return@launch
+            fused = f; measured = m; solvedFor = tag
+            updateGuidance(); updateMap()
+        }
     }
 
     // ------------------------------------------------------------------ lookup
@@ -327,18 +426,14 @@ class MainActivity : AppCompatActivity() {
         val requested = cell.key
         lifecycleScope.launch {
             val r = lookup.lookup(cell, key)
-            if (serving?.key != requested) return@launch   // cell changed meanwhile
+            if (serving?.key != requested) return@launch
             when (r) {
-                is LookupOutcome.Found -> {
-                    dbTower = r.tower; lookupMsg = null; useEstimate = false; mapFitted = false
-                }
-                is LookupOutcome.NotFound -> {
-                    dbTower = null; lookupMsg = getString(R.string.not_found)
-                }
-                is LookupOutcome.Failed -> {
-                    dbTower = null; lookupMsg = "Lookup failed: ${r.message}"
-                }
+                is LookupOutcome.Found -> { dbTower = r.tower; lookupMsg = null; mapFitted = false }
+                is LookupOutcome.NotFound -> { dbTower = null; lookupMsg = getString(R.string.not_found) }
+                is LookupOutcome.Failed -> { dbTower = null; lookupMsg = "Lookup failed: ${r.message}" }
             }
+            solvedFor = ""
+            maybeSolve()
             updateGuidance()
             updateMap()
         }
@@ -365,54 +460,94 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ------------------------------------------------------------------ guidance
+    // ------------------------------------------------------------------ tools
 
-    private data class Target(val label: String, val point: GeoPoint)
-
-    private fun currentTarget(): Target? {
-        val cell = serving ?: return null
-        val est = estimator.estimate(cell.siteKey)
-        val db = dbTower
-        val estT = est?.let {
-            Target("Your signal estimate (${it.points} points, best ${it.bestDbm} dBm)", GeoPoint(it.lat, it.lon))
+    private fun toggleHunt() {
+        if (hunt.running) {
+            hunt.stop(); btnHunt.text = "Hunt sound: OFF"
+        } else {
+            hunt.start(); btnHunt.text = "Hunt sound: ON"
         }
-        val dbT = db?.let {
-            Target("OpenCelliD (±${it.rangeM ?: "?"} m, ${it.samples ?: "?"} samples)", GeoPoint(it.lat, it.lon))
-        }
-        return if (useEstimate) estT ?: dbT else dbT ?: estT
     }
 
-    private fun toggleTarget() {
-        val cell = serving ?: return
-        if (estimator.estimate(cell.siteKey) == null) {
-            val n = estimator.count(cell.siteKey)
-            Toast.makeText(this,
-                "Own estimate not ready: $n/${SignalEstimator.MIN_POINTS} points. Walk around (50 m+) with GPS on.",
-                Toast.LENGTH_LONG).show()
-            return
+    private fun exportTo(uri: Uri) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val ok = try {
+                contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { store.exportCsv(it) } != null
+            } catch (_: Exception) { false }
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity,
+                    if (ok) "Exported measurements" else "Export failed", Toast.LENGTH_SHORT).show()
+            }
         }
-        useEstimate = !useEstimate
-        mapFitted = false
-        updateGuidance(); updateMap()
+    }
+
+    private fun confirmClear() {
+        val cell = serving ?: return
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Clear measurements?")
+            .setMessage("Delete the ${store.count(cell.siteKey)} saved points for this tower and start fresh?")
+            .setPositiveButton("Clear") { _, _ ->
+                store.clear(cell.siteKey); saveAsync()
+                fused = null; measured = null; solvedFor = ""
+                updateGuidance(); updateMap()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------ guidance
+
+    private data class Target(val label: String, val point: GeoPoint, val errM: Double?)
+
+    private fun dbTarget() = dbTower?.let {
+        Target("OpenCelliD database (coverage ±${it.rangeM ?: "?"} m, ${it.samples ?: "?"} samples)",
+            GeoPoint(it.lat, it.lon), it.rangeM?.toDouble())
+    }
+
+    private fun solTarget(s: Solution?, name: String) = s?.let {
+        val parts = ArrayList<String>()
+        if (it.usedSignal) parts.add("${it.points} signal pts")
+        if (it.taPoints > 0) parts.add("${it.taPoints} TA")
+        if (it.usedPrior) parts.add("database")
+        Target(String.format(Locale.US, "%s ±%d m (%s, n=%.1f)",
+            name, it.errorM.roundToInt(), parts.joinToString(" + "), it.pathLossExp),
+            GeoPoint(it.lat, it.lon), it.errorM)
+    }
+
+    private fun currentTarget(): Target? = when (mode) {
+        Mode.BEST -> solTarget(fused, "Best fit") ?: dbTarget()
+        Mode.DATABASE -> dbTarget()
+        Mode.MEASURED -> solTarget(measured, "Measured fit")
     }
 
     private fun updateGuidance() {
         val loc = myLoc
         val t = currentTarget()
         val cell = serving
-        val samples = cell?.let { estimator.count(it.siteKey) } ?: 0
         val extra = buildString {
             lookupMsg?.let { append("\n").append(it) }
-            if (cell != null) append("\nOwn-estimate points for this tower: $samples")
+            if (cell != null) {
+                val n = store.count(cell.siteKey)
+                val ta = store.taCount(cell.siteKey)
+                append("\nSaved points for this tower: $n ($ta with TA)")
+                if (measured == null && n < TowerSolver.MIN_SIGNAL_POINTS && ta < 3)
+                    append(" – walk around to build your own fix")
+                val db = dbTower; val m = measured
+                if (db != null && m != null) {
+                    val gap = GeoMath.distance(db.lat, db.lon, m.lat, m.lon)
+                    append("\nDatabase vs your measurements differ by ${GeoMath.formatDistance(gap)}")
+                }
+            }
         }
 
         if (t == null) {
-            tvTarget.text = "No tower position yet." + extra
+            tvTarget.text = (if (mode == Mode.BEST) "No tower position yet." else "No position for this target mode yet.") + extra
             tvDistance.text = "—"
             arrow.alpha = 0.2f
             return
         }
-        tvTarget.text = "Target: ${t.label}$extra"
+        tvTarget.text = "${t.label}$extra"
         if (loc == null) {
             tvDistance.text = "Waiting for GPS fix… (go outdoors)"
             arrow.alpha = 0.2f
@@ -426,10 +561,13 @@ class MainActivity : AppCompatActivity() {
             arrow.alpha = 0.2f
             if (compass.available) tvHeading.text = "Starting compass…"
         } else {
-            arrow.alpha = 1f
+            // Arrow fades when you are inside the uncertainty circle (direction is meaningless there)
+            val inside = t.errM != null && d < t.errM
+            arrow.alpha = if (inside) 0.45f else 1f
             arrow.rotation = ((b - heading) % 360f + 360f) % 360f
-            tvHeading.text = String.format(Locale.US, "Phone facing %d° %s%s",
+            tvHeading.text = String.format(Locale.US, "Phone facing %d° %s%s%s",
                 heading.roundToInt(), GeoMath.cardinal(heading),
+                if (inside) "\nYou are inside the uncertainty zone – look up for the mast" else "",
                 if (compassNeedsCal) "\n⚠ Compass inaccurate: wave phone in a figure-8" else "")
         }
     }
@@ -441,8 +579,7 @@ class MainActivity : AppCompatActivity() {
         map.setTileSource(TileSourceFactory.MAPNIK)
         map.setMultiTouchControls(true)
         map.controller.setZoom(15.0)
-        map.controller.setCenter(GeoPoint(20.59, 78.96))   // India until GPS arrives
-        // Let the map get gestures inside the ScrollView
+        map.controller.setCenter(GeoPoint(20.59, 78.96))
         map.setOnTouchListener { v, ev ->
             v.parent.requestDisallowInterceptTouchEvent(ev.action != MotionEvent.ACTION_UP)
             false
@@ -453,32 +590,33 @@ class MainActivity : AppCompatActivity() {
         val ov = map.overlays
         ov.clear()
         val pts = ArrayList<GeoPoint>()
+        val loc = myLoc
 
         dbTower?.let { t ->
             val p = GeoPoint(t.lat, t.lon)
             t.rangeM?.let { r ->
-                rangeCircle.points = Polygon.pointsAsCircle(p, r.toDouble())
-                ov.add(rangeCircle)
+                dbCircle.points = Polygon.pointsAsCircle(p, r.toDouble()); ov.add(dbCircle)
             }
-            dbMarker.position = p
-            ov.add(dbMarker)
+            dbMarker.position = p; ov.add(dbMarker)
         }
-        serving?.let { estimator.estimate(it.siteKey) }?.let { e ->
-            estMarker.position = GeoPoint(e.lat, e.lon)
-            ov.add(estMarker)
+        val sol = if (mode == Mode.MEASURED) measured else (fused ?: measured)
+        if (mode != Mode.DATABASE) sol?.let { s ->
+            val p = GeoPoint(s.lat, s.lon)
+            fitCircle.points = Polygon.pointsAsCircle(p, s.errorM.coerceAtLeast(10.0)); ov.add(fitCircle)
+            fitMarker.position = p; ov.add(fitMarker)
         }
-        val loc = myLoc
+        val ta = serving?.taM
+        if (loc != null && ta != null) {
+            taRing.points = Polygon.pointsAsCircle(GeoPoint(loc.latitude, loc.longitude), ta.toDouble())
+            ov.add(taRing)
+        }
         val target = currentTarget()
         if (loc != null) {
             val me = GeoPoint(loc.latitude, loc.longitude)
             if (target != null) {
-                line.setPoints(listOf(me, target.point))
-                ov.add(line)
-                pts.add(target.point)
+                line.setPoints(listOf(me, target.point)); ov.add(line); pts.add(target.point)
             }
-            meMarker.position = me
-            ov.add(meMarker)
-            pts.add(me)
+            meMarker.position = me; ov.add(meMarker); pts.add(me)
         } else if (target != null) {
             pts.add(target.point)
         }
@@ -488,8 +626,7 @@ class MainActivity : AppCompatActivity() {
                 if (pts.size >= 2) {
                     map.zoomToBoundingBox(BoundingBox.fromGeoPoints(pts).increaseByScale(1.5f), false)
                 } else {
-                    map.controller.setZoom(16.0)
-                    map.controller.setCenter(pts[0])
+                    map.controller.setZoom(16.0); map.controller.setCenter(pts[0])
                 }
             }
             mapFitted = pts.size >= 2

@@ -19,7 +19,9 @@ data class CellData(
     val channel: Int?,          // ARFCN / UARFCN / EARFCN / NR-ARFCN
     val dbm: Int?,              // Signal strength (RSRP for LTE/NR)
     val registered: Boolean,    // true = this is the serving cell of a SIM
-    val operator: String?
+    val operator: String?,
+    val taRaw: Int? = null,     // Timing Advance index reported by the modem
+    val taM: Int? = null        // Distance to the tower implied by TA (centre of the TA bin), metres
 ) {
     val isComplete: Boolean get() = mcc != null && mnc != null && area != null && cid != null
 
@@ -36,6 +38,11 @@ data class CellData(
 
 object CellReader {
 
+    /** One LTE TA step = 16 Ts = 0.52 µs round trip → 78.12 m one-way. */
+    const val LTE_TA_M = 78.12
+    /** One GSM TA step ≈ 553.5 m. */
+    const val GSM_TA_M = 553.5
+
     private fun ok(v: Int): Boolean = v != CellInfo.UNAVAILABLE && v != Int.MAX_VALUE && v != Int.MIN_VALUE
     private fun okL(v: Long): Boolean = v != CellInfo.UNAVAILABLE_LONG && v != Long.MAX_VALUE
 
@@ -48,7 +55,9 @@ object CellReader {
                 id.tac.takeIf { ok(it) }, id.ci.takeIf { ok(it) }?.toLong(),
                 id.pci.takeIf { ok(it) }, id.earfcn.takeIf { ok(it) },
                 s.dbm.takeIf { ok(it) }, info.isRegistered,
-                id.operatorAlphaLong?.toString()
+                id.operatorAlphaLong?.toString(),
+                s.timingAdvance.takeIf { it in 0..1282 },
+                s.timingAdvance.takeIf { it in 0..1282 }?.let { ((it + 0.5) * LTE_TA_M).toInt() }
             )
         }
         is CellInfoNr -> {
@@ -81,7 +90,9 @@ object CellReader {
                 id.lac.takeIf { ok(it) }, id.cid.takeIf { ok(it) }?.toLong(),
                 id.bsic.takeIf { ok(it) }, id.arfcn.takeIf { ok(it) },
                 s.dbm.takeIf { ok(it) }, info.isRegistered,
-                id.operatorAlphaLong?.toString()
+                id.operatorAlphaLong?.toString(),
+                s.timingAdvance.takeIf { it in 0..219 },
+                s.timingAdvance.takeIf { it in 0..219 }?.let { ((it + 0.5) * GSM_TA_M).toInt() }
             )
         }
         else -> null
