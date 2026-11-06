@@ -93,14 +93,25 @@ Or build it yourself:
 * `MeasurementStore.kt` saves points as JSON per site and exports CSV.
 * `Compass.kt` uses the rotation vector, adds `GeomagneticField` declination and applies a wrap-safe low-pass filter. `GeoMath.kt` has the haversine distance and bearing.
 
+## How the direction arrow works (v3)
+Phone compasses are often off by tens of degrees, from phone cases, steel, cars or poor calibration, and many budget phones have **no magnetometer at all**.
+So the arrow does **not** trust the compass. It uses the method of professional navigation systems that combine motion sensors with GPS:
+
+    true heading = gyro yaw + offset
+* **Gyro yaw** comes from `GAME_ROTATION_VECTOR` (gyroscope + accelerometer, no magnetometer). It is smooth and immune to magnetic interference, but its zero is arbitrary.
+* **The offset** is estimated by a Kalman filter on the circle (`HeadingFusion.kt`) from:
+  * **GPS track course**: walk about 15 m straight with the phone pointing ahead (`CourseTracker.kt` checks the path is straight and the phone was steady),
+  * **GPS Doppler course** while moving faster than about 4 km/h,
+  * **the magnetometer**, cross-checked only. It is ignored when the field strength is outside the normal 25–65 µT,
+    and switched off automatically if it disagrees with GPS by more than 20°.
+* After locking, the arrow stays correct when you stop and turn, because the gyro tracks rotation. It re-locks automatically as you keep walking or driving.
+* The screen shows the heading source and its ± uncertainty. **Map: heading-up** rotates the map with you, so you can check it against the real streets.
+* Tests: `HeadingFusionTest` (simulated 10-minute walk with turns: worst error about 6°; a compass biased by 50° is detected and ignored) and `CourseTrackerTest`.
+
 ## If the direction looks wrong
-* **Check the map first.** The red line on the map goes from you to the tower and does not use the compass.
-  If the line is right but the arrow isn't, the compass is the problem.
-* **Compass problems:** wave the phone in a figure-8, and stay away from metal, magnets, magnetic phone cases and car dashboards.
-  The phone can be held flat or upright.
-* **In a car, bike or bus,** use **Heading: GPS travel**. This is the default (AUTO) above 9 km/h. It uses your direction of travel instead of the compass,
-  because vehicle metal ruins magnetic compasses.
-* **Database problems:** some OpenCelliD entries are placed badly (few samples). Compare with the green "best fit" once you've moved around.
+* Tap **CALIBRATE**, then walk about 15 m straight, outdoors, holding the phone pointing ahead.
+* Check the red map line. It doesn't use any sensor except GPS.
+* Long-press **CALIBRATE** to let the compass be used again after you've moved away from interference.
 
 ## Getting the most accurate result
 1. Tap **Locate tower** to get the database position.
