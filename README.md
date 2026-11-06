@@ -40,7 +40,12 @@ of the phones that saw that cell. In practice:
 2. Copy your **access token** (it starts with `pk.`).
 3. Paste it in the app when it asks, or later with the **API key** button.
 
-## Step 2: Get the APK. Option A needs no software install.
+## Step 2: Get the APK
+**Easiest:** on your phone, open
+https://github.com/boobalan-d/cell-tower-locator/releases/latest/download/CellTowerLocator.apk
+and install it. Every push to `main` rebuilds this automatically.
+
+Or build it yourself:
 ### A) Build free on GitHub
 1. Create a free GitHub account and a new repository.
 2. Upload all the files in this folder, keeping the folder structure. On GitHub use "Add file → Upload files" and drag the whole folder in.

@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,3 +35,19 @@ jobs:
         with:
           name: CellTowerLocator-apk
           path: app/build/outputs/apk/debug/*.apk
+
+      - name: Rename APK
+        if: github.ref == 'refs/heads/main'
+        run: cp app/build/outputs/apk/debug/app-debug.apk CellTowerLocator.apk
+
+      - name: Publish to Releases (direct phone download)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Cell Tower Locator (latest build)
+          body: |
+            Automatic build of commit ${{ github.sha }}.
+            Download **CellTowerLocator.apk** below and install it on Android 10 or newer.
+          files: CellTowerLocator.apk
+          make_latest: true
