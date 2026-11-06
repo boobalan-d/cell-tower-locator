@@ -51,15 +51,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private enum class HeadingMode(val label: String) {
-        AUTO("Heading: AUTO"),
-        COMPASS("Heading: COMPASS"),
-        GPS("Heading: GPS travel")
+        AUTO("Heading: AUTO (gyro+GPS)"),
+        COMPASS("Heading: raw COMPASS"),
+        GPS("Heading: GPS travel only")
     }
 
     // ---- services & helpers
     private lateinit var tm: TelephonyManager
     private lateinit var lm: LocationManager
-    private lateinit var compass: Compass
+    private lateinit var engine: HeadingEngine
+    private val course = CourseTracker()
     private lateinit var lookup: TowerLookup
     private lateinit var store: MeasurementStore
     private val hunt = HuntSound()
@@ -81,6 +82,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnHunt: Button
     private lateinit var btnHeading: Button
     private lateinit var tvTurn: TextView
+    private lateinit var btnCalib: Button
+    private lateinit var btnMapUp: Button
 
     // ---- state
     private var registered: List<CellData> = emptyList()
@@ -89,8 +92,9 @@ class MainActivity : AppCompatActivity() {
     private var dbTower: TowerResult? = null
     private var lookupMsg: String? = null
     private var myLoc: Location? = null
-    private var heading = Float.NaN
-    private var compassNeedsCal = false
+    private var calibrating = false
+    private var mapHeadingUp = false
+    private var lastMapRotation = 0f
     private var mode = Mode.BEST
     private var headingMode = HeadingMode.AUTO
     private var validTaSeen = false     // Samsung-style modems report a fixed TA=0 until real TA appears
@@ -196,10 +200,22 @@ class MainActivity : AppCompatActivity() {
         lm = getSystemService(LocationManager::class.java)
         lookup = TowerLookup(this)
         store = MeasurementStore(File(filesDir, "measurements.json"))
-        compass = Compass(this) { deg, needsCal ->
-            heading = deg
-            compassNeedsCal = needsCal
+        engine = HeadingEngine(this) {
             updateGuidance()
+            rotateMapIfNeeded()
+        }
+        btnCalib = findViewById(R.id.btnCalib)
+        btnMapUp = findViewById(R.id.btnMapUp)
+        btnCalib.setOnClickListener { startCalibration() }
+        btnCalib.setOnLongClickListener {
+            engine.fusion.trustCompassAgain()
+            Toast.makeText(this, "Compass re-enabled for cross-checking", Toast.LENGTH_SHORT).show(); true
+        }
+        btnMapUp.setOnClickListener {
+            mapHeadingUp = !mapHeadingUp
+            btnMapUp.text = if (mapHeadingUp) "Map: heading-up" else "Map: north-up"
+            if (!mapHeadingUp) { map.mapOrientation = 0f; lastMapRotation = 0f }
+            rotateMapIfNeeded()
         }
 
         setupMap()
@@ -225,7 +241,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        if (!compass.available) tvHeading.text = getString(R.string.no_compass)
+        if (!engine.hasGyro && !engine.hasMagnetometer) tvHeading.text = getString(R.string.no_compass)
 
         if (!hasFine()) {
             permLauncher.launch(arrayOf(
@@ -239,14 +255,15 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         map.onResume()
-        compass.start()
+        engine.start()
         if (hasFine()) startSensing()
     }
 
     override fun onPause() {
         super.onPause()
         map.onPause()
-        compass.stop()
+        engine.stop()
+        course.clear()
         stopSensing()
         if (hunt.running) toggleHunt()
         saveAsync()
@@ -285,7 +302,8 @@ class MainActivity : AppCompatActivity() {
             System.currentTimeMillis() - cur.time > 10_000
         if (!accept) return
         myLoc = loc
-        compass.updateLocation(loc)
+        engine.updateLocation(loc)
+        if (loc.provider == LocationManager.GPS_PROVIDER) feedCourse(loc)
         updateGuidance()
         updateMap()
     }
@@ -589,11 +607,7 @@ class MainActivity : AppCompatActivity() {
         if (h == null) {
             arrow.alpha = 0.2f
             tvTurn.text = ""
-            tvHeading.text = when {
-                headingMode == HeadingMode.GPS -> "GPS heading needs movement above 9 km/h. Use the bearing and map line."
-                compass.available -> "Starting compass…"
-                else -> getString(R.string.no_compass)
-            }
+            tvHeading.text = headingHelp()
         } else {
             val (deg, source) = h
             val inside = t.errM != null && d < t.errM
@@ -608,23 +622,112 @@ class MainActivity : AppCompatActivity() {
                 rel > 0 -> "$a° to your RIGHT"
                 else -> "$a° to your LEFT"
             }
-            tvHeading.text = String.format(Locale.US, "Heading %d° %s from %s%s",
-                deg.roundToInt(), GeoMath.cardinal(deg), source,
-                if (source == "compass" && compassNeedsCal) "\n⚠ Compass inaccurate: wave phone in a figure-8, away from metal" else "")
+            tvHeading.text = String.format(Locale.US, "Heading %d° %s • %s", deg.roundToInt(), GeoMath.cardinal(deg), source) +
+                magStatus()
         }
     }
 
-    /** Compass when walking; GPS course when moving fast (vehicles distort the compass). */
+    /**
+     * AUTO: gyro yaw + GPS-anchored offset (Kalman-fused). Until it locks, fall back to the
+     * live GPS travel direction while moving, then to the compass only if it passes all checks.
+     */
     private fun effectiveHeading(loc: Location): Pair<Float, String>? {
-        val moving = loc.hasSpeed() && loc.speed >= 2.5f && loc.hasBearing() &&
-            System.currentTimeMillis() - loc.time < 4_000
-        val gps = if (moving) loc.bearing to "GPS travel direction" else null
-        val comp = if (!heading.isNaN()) heading to "compass" else null
+        val f = engine.fusion
+        val dop = dopplerCourse(loc)
+        val gps = dop?.let { it.first.toFloat() to "GPS travel direction" }
+        val comp = engine.compassHeading?.takeIf { engine.compassUsable && f.magTrusted }
+            ?.let { it.toFloat() to "compass (not yet GPS-verified)" }
         return when (headingMode) {
             HeadingMode.GPS -> gps
-            HeadingMode.COMPASS -> comp
-            HeadingMode.AUTO -> gps ?: comp
+            HeadingMode.COMPASS -> engine.compassHeading?.let { it.toFloat() to "raw compass" }
+            HeadingMode.AUTO -> {
+                val fused = engine.heading()
+                if (fused != null) {
+                    val src = when (f.lastSource) {
+                        HeadingFusion.Source.GPS -> "locked by GPS"
+                        HeadingFusion.Source.CALIBRATION -> "locked by calibration walk"
+                        HeadingFusion.Source.COMPASS -> "gyro + compass"
+                        null -> "gyro"
+                    }
+                    fused.toFloat() to "$src, ±${f.sigmaDeg.roundToInt()}°"
+                } else gps ?: comp
+            }
         }
+    }
+
+    /** GPS chip's Doppler course: reliable once moving faster than a slow walk. */
+    private fun dopplerCourse(loc: Location): Pair<Double, Double>? {
+        if (loc.provider != LocationManager.GPS_PROVIDER) return null
+        if (System.currentTimeMillis() - loc.time > 4_000) return null
+        if (!loc.hasSpeed() || loc.speed < 1.2f || !loc.hasBearing()) return null
+        val acc = if (loc.hasBearingAccuracy()) loc.bearingAccuracyDegrees.toDouble() else 15.0
+        if (acc > 20.0) return null
+        return loc.bearing.toDouble() to acc.coerceAtLeast(4.0)
+    }
+
+    private fun feedCourse(loc: Location) {
+        val c = course.add(CourseTracker.Fix(loc.latitude, loc.longitude,
+            if (loc.hasAccuracy()) loc.accuracy.toDouble() else 99.0, System.currentTimeMillis(), engine.gyroYaw))
+        if (c != null) {
+            val ok = engine.onCourse(c, calibrating)
+            if (calibrating && ok) {
+                calibrating = false
+                Toast.makeText(this, "Direction locked (±${engine.fusion.sigmaDeg.roundToInt()}°). Arrow is now gyro-stabilised.",
+                    Toast.LENGTH_LONG).show()
+            }
+        } else if (!calibrating) {
+            dopplerCourse(loc)?.let { (deg, sigma) -> engine.onDopplerCourse(deg, sigma) }
+        }
+    }
+
+    private fun startCalibration() {
+        if (!engine.hasGyro) {
+            Toast.makeText(this, "No gyroscope: the arrow uses GPS travel direction while you move.", Toast.LENGTH_LONG).show()
+            return
+        }
+        engine.fusion.reset()
+        course.clear()
+        calibrating = true
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Lock the direction")
+            .setMessage(getString(R.string.calib_help))
+            .setPositiveButton("Start", null)
+            .show()
+        updateGuidance()
+    }
+
+    private fun headingHelp(): String = when {
+        calibrating -> String.format(Locale.US,
+            "CALIBRATING: walk straight, phone pointing ahead… %.0f / 15 m", course.progressM)
+        headingMode == HeadingMode.GPS -> "GPS travel direction needs you to be moving."
+        headingMode == HeadingMode.COMPASS && !engine.hasMagnetometer -> "This phone has NO magnetic compass sensor."
+        !engine.hasGyro && !engine.hasMagnetometer -> getString(R.string.no_compass)
+        else -> String.format(Locale.US,
+            "Direction not locked yet. Walk ~15 m straight holding the phone pointing ahead (%.0f / 15 m), or tap CALIBRATE.",
+            course.progressM) + magStatus()
+    }
+
+    private fun magStatus(): String {
+        if (!engine.hasMagnetometer) return "\nNo magnetic compass on this phone → using gyro + GPS only"
+        val f = engine.fusion
+        return when {
+            !f.magTrusted -> String.format(Locale.US,
+                "\n⚠ Compass disagreed with GPS by %.0f° → ignored (long-press CALIBRATE to retry)", kotlin.math.abs(f.magDisagreementDeg))
+            !engine.fieldOk && !engine.fieldUT.isNaN() -> String.format(Locale.US,
+                "\n⚠ Magnetic interference (%.0f µT, normal 25–65) → compass ignored", engine.fieldUT)
+            else -> ""
+        }
+    }
+
+    private fun rotateMapIfNeeded() {
+        if (!mapHeadingUp) return
+        val loc = myLoc ?: return
+        val h = effectiveHeading(loc)?.first ?: return
+        val target = -h
+        val diff = ((target - lastMapRotation + 540f) % 360f) - 180f
+        if (kotlin.math.abs(diff) < 2f) return
+        lastMapRotation = target
+        map.mapOrientation = target
     }
 
     // ------------------------------------------------------------------ map

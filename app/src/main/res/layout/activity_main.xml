@@ -98,8 +98,31 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center"
-            android:text="Point the top of the phone (or its camera, if upright) where you are going"
+            android:text="Walk ~15 m straight with the phone pointing ahead to lock the direction"
             android:textSize="13sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnCalib"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:text="Calibrate" />
+
+            <Button
+                android:id="@+id/btnMapUp"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:text="Map: north-up" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/tvTarget"

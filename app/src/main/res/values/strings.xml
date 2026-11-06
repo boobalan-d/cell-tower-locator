@@ -4,7 +4,8 @@
     <string name="need_permission">Precise location permission is required. Android only shows cell IDs to apps that have it. Enable it in Settings → Apps → Cell Tower Locator → Permissions.</string>
     <string name="location_off">⚠ Location is OFF. Turn it on in Quick Settings. Android hides cell IDs and GPS while it is off.</string>
     <string name="no_cell">No connected cell with a full ID is visible.\nCheck: SIM inserted, not in airplane mode, Location ON. Some phones hide the ID while on Wi-Fi calling.</string>
-    <string name="no_compass">This phone has no compass sensor. Use the bearing in degrees and the map instead.</string>
+    <string name="no_compass">This phone has no gyroscope or compass. The arrow uses GPS travel direction while you move. When standing still use the bearing in degrees and the map line.</string>
     <string name="not_found">This cell is not in OpenCelliD yet. Walk or drive around for a few minutes and the app will estimate the tower from your own signal readings. The green marker will appear once you have enough points.</string>
     <string name="key_help">The free OpenCelliD database gives tower positions. Sign up at opencellid.org, copy your access token (it starts with pk.), and paste it here. Results are cached on your phone to save your daily quota.</string>
+    <string name="calib_help">Phone compasses are often wrong by tens of degrees, and many phones have none. This app locks direction using your GPS track instead.\n\n1. Go outdoors with a clear sky.\n2. Hold the phone in front of you, top edge (or camera) pointing where you walk.\n3. Walk about 15 m in a straight line without turning the phone.\n\nAfter that the gyroscope keeps the arrow correct even when you stop or turn. While driving it re-locks automatically.</string>
 </resources>
