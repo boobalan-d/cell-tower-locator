@@ -11,7 +11,7 @@ import kotlin.math.sqrt
  * Derives a trustworthy walking/driving course from the GPS track and pairs it with the
  * gyro yaw measured over the same stretch. A result is produced only when:
  *  • you moved ≥ [minDistM] in ≤ 30 s with good GPS (accuracy ≤ 15 m),
- *  • the path was straight (path length ≤ 1.2 × straight distance),
+ *  • the path was straight (no fix more than max(3 m, 15 %) off the line),
  *  • the phone was held steadily (gyro-yaw spread ≤ 15°), so phone direction ≈ walking direction.
  */
 class CourseTracker(private val minDistM: Double = 15.0) {
@@ -35,16 +35,26 @@ class CourseTracker(private val minDistM: Double = 15.0) {
 
         val first = fixes.first()
         val straight = GeoMath.distance(first.lat, first.lon, f.lat, f.lon)
-        var path = 0.0
-        for (i in 1 until fixes.size) {
-            val a = fixes[i - 1]; val b = fixes[i]
-            path += GeoMath.distance(a.lat, a.lon, b.lat, b.lon)
-        }
-        // A bend (or GPS jitter while standing) → restart the segment from recent fixes
-        if (straight > 5.0 && path > 1.2 * straight + 6.0) {
-            while (fixes.size > 2) fixes.removeFirst()
-            progressM = 0.0
-            return null
+        // Straightness: every intermediate fix must lie close to the first→last line.
+        // (Path-length tests fail on GPS jitter; this one rejects corners but not jitter.)
+        val kx = 111_320.0 * cos(Math.toRadians(first.lat))
+        val ky = 110_540.0
+        val ex = (f.lon - first.lon) * kx
+        val ey = (f.lat - first.lat) * ky
+        val len = hypot(ex, ey)
+        if (len > 5.0) {
+            val maxDev = max(3.0, 0.15 * len)
+            for (p in fixes) {
+                val px = (p.lon - first.lon) * kx
+                val py = (p.lat - first.lat) * ky
+                val dev = kotlin.math.abs(px * ey - py * ex) / len
+                if (dev > maxDev) {
+                    // A corner: restart the segment from the most recent fixes
+                    while (fixes.size > 2) fixes.removeFirst()
+                    progressM = 0.0
+                    return null
+                }
+            }
         }
         progressM = straight
         if (straight < minDistM) return null

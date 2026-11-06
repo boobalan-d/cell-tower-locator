@@ -46,7 +46,12 @@ class CourseTrackerTest {
     }
 
     @Test
-    fun zigzag_rejected() {
-        assertNull(walk(45.0, { 0.0 }, wobble = 8.0))
+    fun cornerWalk_neverGivesFalseDiagonal() {
+        // 10 m north then 14 m east: a naive first→last course would say ~55°, which is wrong for both legs
+        val t = CourseTracker()
+        var res: CourseTracker.Course? = null
+        val pts = (0..7).map { at(0.0, it * 1.4) } + (1..10).map { at(it * 1.4, 9.8) }
+        pts.forEachIndexed { i, p -> res = t.add(CourseTracker.Fix(p[0], p[1], 4.0, i * 1000L, 0.0)) ?: res }
+        res?.let { assertTrue("got ${it.courseDeg}", abs(wrap180(it.courseDeg - 90.0)) < 10 || abs(wrap180(it.courseDeg)) < 10) }
     }
 }
